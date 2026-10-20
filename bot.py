@@ -12,6 +12,7 @@ import re
 import time
 from zoneinfo import ZoneInfo
 import responses
+import social_embeds
 import botFunctions as bf
 import channel_config
 import economy
@@ -222,6 +223,14 @@ HIDDEN_COMMANDS = {'vini'}
 MUSIC_GUILD_ID = 748160430828027916
 MUSIC_COMMANDS = {'recsong'}
 MUSIC_FEATURES = {'sotd'}
+
+# Servers where the bot leaves social media links alone instead of posting
+# its own preview of them (see social_embeds.py).
+SOCIAL_PREVIEW_EXCLUDED_GUILDS = {MUSIC_GUILD_ID}
+
+# Discord's upload limit for a bot: 10 MB, more in servers boosted to
+# level 2 or 3. Videos bigger than this get a cover image instead.
+BASE_UPLOAD_LIMIT = 10 * 1024 * 1024
 
 
 def _features_for(guild_id) -> dict[str, str]:
@@ -1757,6 +1766,77 @@ def run_discord_bot():
                 await channel.send(embed=_embed(chunk))
         except Exception as e:
             logger.warning(f"update_log: couldn't post the update summary: {e}")
+
+    @client.listen('on_message')
+    async def social_media_previews(message: discord.Message):
+        """Replies to X, Reddit, Instagram and TikTok links with a full
+        preview of the post -- author, text, image, stats -- plus the video
+        itself when it's small enough to upload, so nobody has to open the
+        link. A listener rather than on_message, so commands still run."""
+        if message.author.bot or (message.guild and message.guild.id in SOCIAL_PREVIEW_EXCLUDED_GUILDS):
+            return
+        if message.content.startswith(('!', '/')):
+            return  # a command that happens to contain a link
+        links = social_embeds.find_links(message.content)
+        if not links:
+            return
+        me = message.guild.me if message.guild else client.user
+        permissions = message.channel.permissions_for(me)
+        if not (permissions.send_messages and permissions.embed_links):
+            return
+
+        posts = await asyncio.gather(*(asyncio.to_thread(social_embeds.fetch, platform, match) for platform, match in links))
+        posts = [post for post in posts if post]
+        if not posts:
+            return
+
+        age_restricted = getattr(message.channel, 'is_nsfw', lambda: False)()
+        upload_limit = BASE_UPLOAD_LIMIT
+        if message.guild and message.guild.premium_tier >= 2:
+            upload_limit = message.guild.filesize_limit
+        embeds, files, uploaded = [], [], 0
+        for post in posts:
+            hide_media = post.sensitive and not age_restricted
+            video = None
+            if post.video and not hide_media and permissions.attach_files:
+                video = await asyncio.to_thread(social_embeds.download_video, post.video, upload_limit - uploaded)
+            if video:
+                uploaded += len(video)
+                files.append(discord.File(io.BytesIO(video), filename=f"{post.platform}-{len(files) + 1}.mp4"))
+
+            embed = discord.Embed(
+                description=social_embeds.description(post, media_hidden=hide_media),
+                color=social_embeds.platform_color(post),
+            )
+            embed.set_author(name=post.author[:256], url=post.author_url, icon_url=social_embeds.platform_icon(post))
+            if post.avatar:
+                embed.set_thumbnail(url=post.avatar)
+            if post.image and not hide_media and not video:
+                # A video plays as the attachment, so its cover would just repeat it.
+                embed.set_image(url=post.image)
+            embeds.append(embed)
+
+        try:
+            await message.reply(embeds=embeds, files=files, mention_author=False)
+        except discord.HTTPException as e:
+            if not files:
+                logger.warning(f"social previews: couldn't reply in channel {message.channel.id}: {e}")
+                return
+            # Most likely the videos were too big after all -- covers instead.
+            for embed, post in zip(embeds, posts):
+                if post.image and not (post.sensitive and not age_restricted):
+                    embed.set_image(url=post.image)
+            try:
+                await message.reply(embeds=embeds, mention_author=False)
+            except discord.HTTPException as e:
+                logger.warning(f"social previews: couldn't reply in channel {message.channel.id}: {e}")
+                return
+
+        if message.guild and permissions.manage_messages:
+            # Hide Discord's own preview of the link, usually broken or
+            # bare for these sites, so the post doesn't show twice.
+            with contextlib.suppress(discord.HTTPException):
+                await message.edit(suppress=True)
 
     @client.event
     async def on_ready():
