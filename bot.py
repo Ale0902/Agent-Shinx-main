@@ -216,12 +216,11 @@ HIDDEN_COMMANDS = {'vini'}
 # The music commands and Song of the Day belong to one server and no other.
 # Their slash commands are registered to that server alone, so anywhere
 # else they don't exist at all; the ! versions do nothing elsewhere; and
-# Song of the Day can't be set up or sent anywhere else. They're also left
-# out of /help everywhere, the home server included.
+# Song of the Day can't be set up or sent anywhere else. /help only lists
+# them in that server.
 MUSIC_GUILD_ID = 748160430828027916
 MUSIC_COMMANDS = {'recsong', 'top5songs'}
 MUSIC_FEATURES = {'sotd'}
-HIDDEN_COMMANDS |= MUSIC_COMMANDS
 
 
 def _features_for(guild_id) -> dict[str, str]:
@@ -1526,6 +1525,8 @@ def run_discord_bot():
         by_category = {category: [] for category in CATEGORY_ORDER}
         for command in client.commands:
             if command.name in HIDDEN_COMMANDS:
+                continue
+            if command.name in MUSIC_COMMANDS and (ctx.guild is None or ctx.guild.id != MUSIC_GUILD_ID):
                 continue
             by_category.setdefault(COMMAND_CATEGORIES.get(command.name, 'Other'), []).append(command)
 
