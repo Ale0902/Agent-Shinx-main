@@ -146,7 +146,7 @@ async def _send_announcement(destination, message: str, artwork_as_thumbnail: bo
     still carries its link, clickable, just without a picture;
     link_preview logs why, so a run of missing pictures is diagnosable
     from the bot's log. destination can be a channel or a command Context
-    -- both expose a compatible .send()."""
+    -- both expose a compatible .send(). Returns the message it sent."""
     embed = _embed(message)
     file = None
 
@@ -171,9 +171,8 @@ async def _send_announcement(destination, message: str, artwork_as_thumbnail: bo
                 embed.set_image(url=artwork)
 
     if file:
-        await destination.send(embed=embed, file=file)
-    else:
-        await destination.send(embed=embed)
+        return await destination.send(embed=embed, file=file)
+    return await destination.send(embed=embed)
 
 
 def _split_by_line(text: str, limit: int = MAX_EMBED_DESC) -> list[str]:
@@ -227,6 +226,9 @@ MUSIC_FEATURES = {'sotd'}
 # Servers where the bot leaves social media links alone instead of posting
 # its own preview of them (see social_embeds.py).
 SOCIAL_PREVIEW_EXCLUDED_GUILDS = {MUSIC_GUILD_ID}
+
+# Added under every Song of the Day so people can vote on the pick.
+SOTD_VOTE_REACTIONS = ("⬆️", "⬇️")
 
 # Discord's upload limit for a bot: 10 MB, more in servers boosted to
 # level 2 or 3. Videos bigger than this get a cover image instead.
@@ -1592,7 +1594,18 @@ def run_discord_bot():
     @_keep_alive
     async def sotd():
         result = await asyncio.to_thread(bf.recsongs)
-        await _broadcast('sotd', lambda channel: _send_announcement(channel, result, artwork_as_thumbnail=True))
+
+        async def send(channel):
+            message = await _send_announcement(channel, result, artwork_as_thumbnail=True)
+            # Up/down votes on the day's pick. A server where the bot can't
+            # add reactions still gets the song, just without them.
+            try:
+                for vote in SOTD_VOTE_REACTIONS:
+                    await message.add_reaction(vote)
+            except discord.HTTPException as e:
+                logger.warning(f"sotd: couldn't add vote reactions in #{getattr(channel, 'name', channel.id)}: {e}")
+
+        await _broadcast('sotd', send)
 
     @tasks.loop(hours=6.0)
     @_keep_alive
