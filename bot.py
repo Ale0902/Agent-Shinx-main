@@ -1853,7 +1853,13 @@ def run_discord_bot():
                         # An X GIF's .mp4 can be over the limit and still make
                         # a GIF under it, so it may be fetched at a larger size.
                         fetch_limit = max(upload_room, GIF_SOURCE_LIMIT) if media.gif else upload_room
-                        data = await asyncio.to_thread(social_embeds.download, media.url, fetch_limit)
+                        # Best quality that fits: each copy that's too big is
+                        # turned away by its size before it's downloaded.
+                        data = None
+                        for url in (media.url, *media.alternates):
+                            data = await asyncio.to_thread(social_embeds.download, url, fetch_limit)
+                            if data:
+                                break
                         name = f"video-{len(uploads) + 1}.mp4"
                         if data and media.gif:
                             gif = await asyncio.to_thread(social_embeds.mp4_to_gif, data, upload_room)

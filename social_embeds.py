@@ -51,6 +51,10 @@ class Media:
     video: bool = False
     cover: str | None = None        # a video's still, shown if the video itself can't be
     gif: bool = False               # an X "GIF" -- really a silent .mp4, turned into a real GIF
+    # Lower-quality copies of a video, best first -- tried in turn when the
+    # main one is too big to upload, so a long video still plays, just
+    # smaller, instead of falling back to its still.
+    alternates: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,7 +190,15 @@ def _x_post(tweet: dict, user: str, tweet_id: str) -> Post:
     media = []
     for item in (tweet.get('media') or {}).get('all') or []:
         if item.get('type') in ('video', 'gif') and item.get('url'):
-            media.append(Media(item['url'], video=True, cover=item.get('thumbnail_url'), gif=item['type'] == 'gif'))
+            # X keeps several .mp4 qualities of each video (1080p, 720p, ...).
+            qualities = sorted(
+                (f for f in item.get('formats') or item.get('variants') or []
+                 if f.get('url') and (f.get('container') == 'mp4' or '.mp4' in f['url'])),
+                key=lambda f: f.get('bitrate') or 0, reverse=True,
+            )
+            urls = [item['url'], *(f['url'] for f in qualities if f['url'] != item['url'])]
+            media.append(Media(urls[0], video=True, cover=item.get('thumbnail_url'), gif=item['type'] == 'gif',
+                               alternates=urls[1:]))
         elif item.get('url'):
             media.append(Media(item['url']))
     quoted = tweet.get('quote')
@@ -315,6 +327,8 @@ def _fetch_tiktok(match: re.Match) -> Post | None:
     handle = author.get('unique_id', '')
     images = data.get('images') or []  # a photo post instead of a video
     cover = data.get('origin_cover') or data.get('cover')
+    play = data.get('hdplay') or data.get('play')
+    video = Media(play, video=True, cover=cover, alternates=[data['play']] if data.get('play') and data['play'] != play else [])
     return Post(
         platform='tiktok',
         url=f"https://www.tiktok.com/@{handle}/{'photo' if images else 'video'}/{data.get('id')}",
@@ -322,7 +336,7 @@ def _fetch_tiktok(match: re.Match) -> Post | None:
         author_url=f"https://www.tiktok.com/@{handle}",
         avatar=author.get('avatar'),
         text=data.get('title') or None,
-        media=[Media(image) for image in images] if images else [Media(data['play'], video=True, cover=cover)] if data.get('play') else [],
+        media=[Media(image) for image in images] if images else ([video] if play else []),
         stats=[(emoji, data.get(key)) for emoji, key in
                (("▶️", 'play_count'), ("❤️", 'digg_count'), ("💬", 'comment_count'), ("🔁", 'share_count'))
                if data.get(key) is not None],
