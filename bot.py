@@ -213,6 +213,25 @@ def _keep_alive(body):
 # eggs that only show up if you already know about them.
 HIDDEN_COMMANDS = {'vini'}
 
+# The music commands and Song of the Day belong to one server and no other.
+# Their slash commands are registered to that server alone, so anywhere
+# else they don't exist at all; the ! versions do nothing elsewhere; and
+# Song of the Day can't be set up or sent anywhere else. They're also left
+# out of /help everywhere, the home server included.
+MUSIC_GUILD_ID = 748160430828027916
+MUSIC_COMMANDS = {'recsong', 'top5songs'}
+MUSIC_FEATURES = {'sotd'}
+HIDDEN_COMMANDS |= MUSIC_COMMANDS
+
+
+def _features_for(guild_id) -> dict[str, str]:
+    """The announcement features this server can set up: every one, minus
+    the music ones anywhere but the music server."""
+    return {
+        key: label for key, label in channel_config.FEATURES.items()
+        if key not in MUSIC_FEATURES or guild_id == MUSIC_GUILD_ID
+    }
+
 # Private maintainer channel for the deploy changelog (see update_log.py).
 # Hardcoded on purpose: this is deliberately NOT a /setchannel feature and
 # has no command of its own, so no other server can opt into it and it
@@ -387,7 +406,7 @@ def _announcement_status(guild_id: int, client: discord.Client) -> str:
     member_of = client.get_guild(guild_id)
     lines = [_not_a_member_notice(client, guild_id), ""] if member_of is None else []
     lines.append("**Announcements in this server**")
-    for key, label in channel_config.FEATURES.items():
+    for key, label in _features_for(guild_id).items():
         if key not in configured:
             lines.append(f"❌ {label} — not set up")
             continue
@@ -441,7 +460,7 @@ class _SetChannelFeatureSelect(discord.ui.Select):
     def __init__(self, parent_view: "SetChannelView"):
         options = [
             discord.SelectOption(label=label, value=key)
-            for key, label in channel_config.FEATURES.items()
+            for key, label in _features_for(parent_view.guild_id).items()
         ]
         super().__init__(
             placeholder="Step 1: choose features to set up...",
@@ -544,9 +563,10 @@ class SetChannelView(discord.ui.View):
     then a channel from a native Discord picker, one step at a time --
     instead of typing feature and channel as command arguments."""
 
-    def __init__(self, author_id):
+    def __init__(self, author_id, guild_id):
         super().__init__(timeout=120)
         self.author_id = author_id
+        self.guild_id = guild_id
         self.features: list[str] = []
         self.message: discord.Message | None = None
         self.add_item(_SetChannelFeatureSelect(self))
@@ -567,6 +587,10 @@ class SetChannelView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+
+def _in_music_guild(ctx: commands.Context) -> bool:
+    return ctx.guild is not None and ctx.guild.id == MUSIC_GUILD_ID
 
 
 async def _take_bet(ctx: commands.Context, bet: int) -> bool:
@@ -796,16 +820,28 @@ def run_discord_bot():
         await ctx.send(embed=_embed("Hello!"))
 
     @client.hybrid_command(name="recsong", description="Recommends a random song from the server's list")
+    @discord.app_commands.guilds(MUSIC_GUILD_ID)
+    @commands.check(_in_music_guild)
     async def recsong(ctx: commands.Context):
         await ctx.defer()
         result = await asyncio.to_thread(bf.recsongs, random.choice(bf.RECSONG_HEADINGS))
         await _send_announcement(ctx, result, artwork_as_thumbnail=True)
 
     @client.hybrid_command(name="top5songs", description="Top 5 songs on iTunes charts!")
+    @discord.app_commands.guilds(MUSIC_GUILD_ID)
+    @commands.check(_in_music_guild)
     async def top5(ctx: commands.Context):
         await ctx.defer()
         result = await asyncio.to_thread(bf.topsongs)
         await _send_announcement(ctx, result)
+
+    async def music_error(ctx: commands.Context, error: commands.CommandError):
+        # !recsong anywhere but the music server: act as if it doesn't exist.
+        if not isinstance(error, commands.CheckFailure):
+            raise error
+
+    for command in (recsong, top5):
+        command.error(music_error)
 
     @client.hybrid_command(name='rolld6', description='Rolls a D6 dice')
     async def rolld6(ctx: commands.Context):
@@ -980,7 +1016,7 @@ def run_discord_bot():
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def setchannel(ctx: commands.Context):
-        view = SetChannelView(author_id=ctx.author.id)
+        view = SetChannelView(author_id=ctx.author.id, guild_id=ctx.guild.id)
         message = await ctx.send(
             embed=_embed(
                 f"{_announcement_status(ctx.guild.id, ctx.bot)}\n\n"
@@ -1519,6 +1555,8 @@ def run_discord_bot():
         # silently kill the feature for every server after it, and for
         # every future tick until a restart.
         for guild_id, channel_id in channel_config.get_all_for_feature(feature).items():
+            if feature in MUSIC_FEATURES and guild_id != MUSIC_GUILD_ID:
+                continue  # set up before music was limited to its own server
             channel = client.get_channel(channel_id)
             if channel is None:
                 try:
@@ -1736,6 +1774,12 @@ def run_discord_bot():
                 loop.start()
         logger.info(f'{client.user} is now running!')
         await client.tree.sync()
+        try:
+            # The music commands are registered to their own server only,
+            # which a global sync doesn't cover.
+            await client.tree.sync(guild=discord.Object(id=MUSIC_GUILD_ID))
+        except discord.HTTPException as e:
+            logger.warning(f"Couldn't sync the music commands to server {MUSIC_GUILD_ID}: {e}")
         await _post_update_log()
 
     @client.event
