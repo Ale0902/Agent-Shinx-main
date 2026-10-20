@@ -1780,12 +1780,39 @@ def run_discord_bot():
         except Exception as e:
             logger.warning(f"update_log: couldn't post the update summary: {e}")
 
+    # social_embeds platform -> "<:social_x:123>", the app emoji drawn
+    # before the author's name; filled in by _load_platform_emojis.
+    platform_emojis: dict[str, str] = {}
+
+    async def _load_platform_emojis():
+        """Makes sure the bot has an app emoji for each platform's icon --
+        the logo shown before the author in a social media preview, the way
+        Keto does it -- uploading any that are missing. App emojis belong to
+        the bot, so they work in every server without any setup there.
+        Never raises: without them the previews just go without icons."""
+        try:
+            existing = {emoji.name: emoji for emoji in await client.fetch_application_emojis()}
+            for platform in social_embeds.PLATFORMS:
+                name = f"social_{platform}"
+                emoji = existing.get(name)
+                if emoji is None:
+                    image = await asyncio.to_thread(
+                        social_embeds.download, social_embeds.platform_icon_url(platform), 256 * 1024
+                    )
+                    if not image:
+                        continue
+                    emoji = await client.create_application_emoji(name=name, image=image)
+                platform_emojis[platform] = str(emoji)
+        except discord.HTTPException as e:
+            logger.warning(f"social previews: couldn't set up the platform icon emojis: {e}")
+
     @client.listen('on_message')
     async def social_media_previews(message: discord.Message):
-        """Replies to X, Reddit, Instagram and TikTok links with a full
-        preview of the post -- author, text, image, stats -- plus the video
-        itself when it's small enough to upload, so nobody has to open the
-        link. A listener rather than on_message, so commands still run."""
+        """Replies to X, Reddit, Instagram and TikTok links with the post
+        itself -- author, text, photos or a playable video, stats -- so
+        nobody has to open the link. Every post goes in one reply, one card
+        each, with a quote tweet's quoted post inside its card. A listener
+        rather than on_message, so commands still run."""
         if message.author.bot or (message.guild and message.guild.id in SOCIAL_PREVIEW_EXCLUDED_GUILDS):
             return
         if message.content.startswith(('!', '/')):
@@ -1803,60 +1830,71 @@ def run_discord_bot():
         if not posts:
             return
 
-        age_restricted = getattr(message.channel, 'is_nsfw', lambda: False)()
-        upload_limit = BASE_UPLOAD_LIMIT
+        # Media marked sensitive sits behind a spoiler outside age-restricted channels.
+        spoiler_sensitive = not getattr(message.channel, 'is_nsfw', lambda: False)()
+        upload_room = BASE_UPLOAD_LIMIT
         if message.guild and message.guild.premium_tier >= 2:
-            upload_limit = message.guild.filesize_limit
-        # One card per post, plus a second, right under it, for the post a
-        # quote tweet quotes -- each card holds one image, so the quoted
-        # post's own media gets room of its own.
-        cards = []
-        for post in posts:
-            cards.append((post, False))
-            if post.quote:
-                cards.append((post.quote, True))
-        # Discord caps a message's embeds at 6000 characters in total.
-        max_text = max(200, 4500 // len(cards))
+            upload_room = message.guild.filesize_limit
+        # Discord caps the text across all of a message's cards at 4000
+        # characters; this keeps every post's text inside that, with room
+        # left for names, stats and links.
+        max_text = max(150, 2800 // (len(posts) + sum(1 for post in posts if post.quote)))
 
-        embeds, covers, files, uploaded = [], [], [], 0
-        for post, quoted in cards:
-            hide_media = post.sensitive and not age_restricted
-            video = None
-            if post.video and not hide_media and permissions.attach_files:
-                video = await asyncio.to_thread(social_embeds.download_video, post.video, upload_limit - uploaded)
-            if video:
-                uploaded += len(video)
-                files.append(discord.File(io.BytesIO(video), filename=f"{post.platform}-{len(files) + 1}.mp4"))
+        # Videos are uploaded so they play inside the card. Downloaded once
+        # up front: {media url: (filename, bytes)}. One too big to upload
+        # shows its cover still instead.
+        uploads: dict[str, tuple[str, bytes]] = {}
+        if permissions.attach_files:
+            for post in posts:
+                for media in [*post.media, *(post.quote.media if post.quote else [])][:social_embeds.MAX_MEDIA]:
+                    if media.video and media.url not in uploads:
+                        data = await asyncio.to_thread(social_embeds.download, media.url, upload_room)
+                        if data:
+                            upload_room -= len(data)
+                            uploads[media.url] = (f"video-{len(uploads) + 1}.mp4", data)
 
-            embed = discord.Embed(
-                description=social_embeds.description(post, media_hidden=hide_media, max_text=max_text, quoted=quoted),
-                color=social_embeds.platform_color(post),
-            )
-            if quoted:
-                embed.set_author(name=f"Quoting {post.author}"[:256], url=post.url, icon_url=post.avatar)
-            else:
-                embed.set_author(name=post.author[:256], url=post.author_url, icon_url=social_embeds.platform_icon(post))
-                if post.avatar:
-                    embed.set_thumbnail(url=post.avatar)
-            cover = post.image if post.image and not hide_media else None
-            if cover and not video:
-                # A video plays as the attachment, so its cover would just repeat it.
-                embed.set_image(url=cover)
-            embeds.append(embed)
-            covers.append(cover)
+        def gallery(post, with_videos: bool):
+            items = []
+            for media in post.media[:social_embeds.MAX_MEDIA]:
+                spoiler = post.sensitive and spoiler_sensitive
+                if media.video and with_videos and media.url in uploads:
+                    items.append(discord.MediaGalleryItem(f"attachment://{uploads[media.url][0]}", spoiler=spoiler))
+                elif media.video:
+                    if media.cover:
+                        items.append(discord.MediaGalleryItem(media.cover, spoiler=spoiler))
+                else:
+                    items.append(discord.MediaGalleryItem(media.url, spoiler=spoiler))
+            return discord.ui.MediaGallery(*items) if items else None
 
+        def build(with_videos: bool) -> discord.ui.LayoutView:
+            view = discord.ui.LayoutView(timeout=None)
+            for post in posts:
+                card = discord.ui.Container(accent_colour=social_embeds.platform_color(post))
+                head = discord.ui.TextDisplay(
+                    social_embeds.header(post, icon=platform_emojis.get(post.platform, ""), max_text=max_text)
+                )
+                card.add_item(discord.ui.Section(head, accessory=discord.ui.Thumbnail(post.avatar)) if post.avatar else head)
+                if media := gallery(post, with_videos):
+                    card.add_item(media)
+                if post.quote:
+                    card.add_item(discord.ui.TextDisplay(social_embeds.quote_block(post.quote, max_text=max_text)))
+                    if media := gallery(post.quote, with_videos):
+                        card.add_item(media)
+                card.add_item(discord.ui.Separator())
+                card.add_item(discord.ui.TextDisplay(social_embeds.footer(post)))
+                view.add_item(card)
+            return view
+
+        files = [discord.File(io.BytesIO(data), filename=name) for name, data in uploads.values()]
         try:
-            await message.reply(embeds=embeds, files=files, mention_author=False)
+            await message.reply(view=build(with_videos=True), files=files, mention_author=False)
         except discord.HTTPException as e:
             if not files:
                 logger.warning(f"social previews: couldn't reply in channel {message.channel.id}: {e}")
                 return
-            # Most likely the videos were too big after all -- covers instead.
-            for embed, cover in zip(embeds, covers):
-                if cover:
-                    embed.set_image(url=cover)
+            # Most likely the videos were too big after all -- stills instead.
             try:
-                await message.reply(embeds=embeds, mention_author=False)
+                await message.reply(view=build(with_videos=False), mention_author=False)
             except discord.HTTPException as e:
                 logger.warning(f"social previews: couldn't reply in channel {message.channel.id}: {e}")
                 return
@@ -1888,6 +1926,8 @@ def run_discord_bot():
             await client.tree.sync(guild=discord.Object(id=MUSIC_GUILD_ID))
         except discord.HTTPException as e:
             logger.warning(f"Couldn't sync /recsong to server {MUSIC_GUILD_ID}: {e}")
+        if not platform_emojis:
+            await _load_platform_emojis()
         await _post_update_log()
 
     @client.event

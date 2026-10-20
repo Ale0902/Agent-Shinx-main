@@ -17,8 +17,8 @@ Instagram and Reddit only show those tags to crawlers they recognise, so
 requests to them identify as Discord's link-preview bot -- the same fetch
 Discord makes when the link is posted.
 
-bot.py turns a Post into the embed (and, for videos small enough to
-upload, a playable attachment).
+This module knows nothing about Discord; bot.py lays a Post out as one
+card (the text pieces come from the formatting helpers at the bottom).
 """
 import datetime
 import html
@@ -39,21 +39,30 @@ FETCH_TIMEOUT = 10
 # At most this many links in one message get a preview.
 MAX_LINKS_PER_MESSAGE = 3
 
+# Discord shows at most 10 items in one media gallery.
+MAX_MEDIA = 10
+
 CACHE_TTL_SECONDS = 600
+
+
+@dataclass
+class Media:
+    url: str
+    video: bool = False
+    cover: str | None = None        # a video's still, shown if the video itself can't be
 
 
 @dataclass
 class Post:
     platform: str                   # key into PLATFORMS
     url: str                        # the post, for "Open in ..."
-    author: str                     # "Adam Schefter (@AdamSchefter)", or a Reddit post's title
+    name: str                       # display name, or a Reddit post's title
+    handle: str | None = None       # "@handle", linked to author_url
     author_url: str | None = None
     avatar: str | None = None
     subtitle: str | None = None     # e.g. "r/okbuddycinephile • u/someone", already linked
     text: str | None = None
-    image: str | None = None
-    video: str | None = None        # direct .mp4, attached when small enough
-    more_media: int = 0             # media beyond the first, e.g. the rest of a carousel
+    media: list[Media] = field(default_factory=list)
     stats: list[tuple[str, int]] = field(default_factory=list)
     posted: int | None = None       # unix time
     posted_date_only: bool = False  # Instagram only gives the day
@@ -61,9 +70,7 @@ class Post:
     quote: "Post | None" = None     # the post a quote tweet is quoting
 
 
-# name, colour, icon for each platform. Icons come from Google's favicon
-# service, which always answers with a PNG -- some of these sites' own
-# icons are .ico or SVG, which Discord won't show in an embed.
+# name, colour, domain (for the icon) for each platform.
 PLATFORMS = {
     'x': ("X", 0x0F1419, "x.com"),  # pure black (0) reads as "no colour" to Discord
     'reddit': ("Reddit", 0xFF4500, "reddit.com"),
@@ -80,8 +87,10 @@ def platform_color(post: Post) -> int:
     return PLATFORMS[post.platform][1]
 
 
-def platform_icon(post: Post) -> str:
-    return f"https://www.google.com/s2/favicons?domain={PLATFORMS[post.platform][2]}&sz=64"
+def platform_icon_url(platform: str, size: int = 128) -> str:
+    """A PNG of the site's icon, from Google's favicon service -- some of
+    these sites' own icons are .ico or SVG, which Discord won't take."""
+    return f"https://www.google.com/s2/favicons?domain={PLATFORMS[platform][2]}&sz={size}"
 
 
 #=========================--FINDING LINKS--==================================#
@@ -162,20 +171,21 @@ def _x_post(tweet: dict, user: str, tweet_id: str) -> Post:
     'quote' is one too, so the quoted post is read the same way."""
     author = tweet.get('author') or {}
     handle = author.get('screen_name') or user
-    media = tweet.get('media') or {}
-    photos, videos = media.get('photos') or [], media.get('videos') or []
-    first_video = videos[0] if videos else None
+    media = []
+    for item in (tweet.get('media') or {}).get('all') or []:
+        if item.get('type') in ('video', 'gif') and item.get('url'):
+            media.append(Media(item['url'], video=True, cover=item.get('thumbnail_url')))
+        elif item.get('url'):
+            media.append(Media(item['url']))
     quoted = tweet.get('quote')
     return Post(
         platform='x',
         url=f"https://x.com/{handle}/status/{tweet.get('id') or tweet_id}",
-        author=f"{author.get('name', handle)} (@{handle})",
+        name=author.get('name', handle), handle=handle,
         author_url=f"https://x.com/{handle}",
         avatar=author.get('avatar_url'),
         text=tweet.get('text') or None,
-        image=photos[0]['url'] if photos else (first_video or {}).get('thumbnail_url'),
-        video=(first_video or {}).get('url'),
-        more_media=max(len(media.get('all') or []) - 1, 0),
+        media=media,
         stats=[(emoji, tweet.get(key)) for emoji, key in
                (("💬", 'replies'), ("🔁", 'retweets'), ("❤️", 'likes'), ("👁️", 'views'))
                if tweet.get(key) is not None],
@@ -204,11 +214,13 @@ def _fetch_reddit(match: re.Match) -> Post | None:
     byline = re.match(r"u/(\S+) on r/(\S+) - ⬆️ (\d+) \| 💬 (\d+)", tags.get('og:site_name', ''))
     if tags.get('og:title') and byline:
         user, sub, score, comments = byline.groups()
+        video = tags.get('og:video') or tags.get('og:video:secure_url')
+        image = tags.get('og:image')
         return Post(
-            platform='reddit', url=url, author=tags['og:title'], author_url=url,
+            platform='reddit', url=url, name=tags['og:title'], author_url=url,
             subtitle=f"[r/{sub}](https://www.reddit.com/r/{sub}/) • [u/{user}](https://www.reddit.com/user/{user}/)",
             text=tags.get('og:description') or None,
-            image=tags.get('og:image') or None,
+            media=[Media(video, video=True, cover=image)] if video else ([Media(image)] if image else []),
             stats=[("⬆️", int(score)), ("💬", int(comments))],
         )
 
@@ -219,9 +231,9 @@ def _fetch_reddit(match: re.Match) -> Post | None:
     if not title:
         return None
     return Post(
-        platform='reddit', url=url, author=title, author_url=url,
+        platform='reddit', url=url, name=title, author_url=url,
         subtitle=f"[r/{sub}](https://www.reddit.com/r/{sub}/)",
-        image=tags.get('og:image') or None,
+        media=[Media(tags['og:image'])] if tags.get('og:image') else [],
     )
 
 
@@ -253,13 +265,12 @@ def _fetch_instagram(match: re.Match) -> Post | None:
     if not caption:
         caption = (re.search(r'on Instagram: "(.*)"$', tags.get('og:title', ''), re.S) or [None, None])[1]
 
-    author = f"{name} (@{handle})" if name and handle else (f"@{handle}" if handle else "Instagram")
+    video = tags.get('og:video:secure_url') or tags.get('og:video')
     return Post(
-        platform='instagram', url=url, author=author,
+        platform='instagram', url=url, name=name or handle or "Instagram", handle=handle,
         author_url=f"https://www.instagram.com/{handle}/" if handle else None,
         text=caption or None,
-        image=tags['og:image'],
-        video=tags.get('og:video:secure_url') or tags.get('og:video') or None,
+        media=[Media(video, video=True, cover=tags['og:image'])] if video else [Media(tags['og:image'])],
         stats=stats, posted=posted, posted_date_only=True,
     )
 
@@ -283,16 +294,15 @@ def _fetch_tiktok(match: re.Match) -> Post | None:
     author = data.get('author') or {}
     handle = author.get('unique_id', '')
     images = data.get('images') or []  # a photo post instead of a video
+    cover = data.get('origin_cover') or data.get('cover')
     return Post(
         platform='tiktok',
         url=f"https://www.tiktok.com/@{handle}/{'photo' if images else 'video'}/{data.get('id')}",
-        author=f"{author.get('nickname') or handle} (@{handle})",
+        name=author.get('nickname') or handle, handle=handle,
         author_url=f"https://www.tiktok.com/@{handle}",
         avatar=author.get('avatar'),
         text=data.get('title') or None,
-        image=images[0] if images else (data.get('origin_cover') or data.get('cover')),
-        video=None if images else data.get('play'),
-        more_media=max(len(images) - 1, 0),
+        media=[Media(image) for image in images] if images else [Media(data['play'], video=True, cover=cover)] if data.get('play') else [],
         stats=[(emoji, data.get(key)) for emoji, key in
                (("▶️", 'play_count'), ("❤️", 'digg_count'), ("💬", 'comment_count'), ("🔁", 'share_count'))
                if data.get(key) is not None],
@@ -325,9 +335,9 @@ def fetch(platform: str, match: re.Match) -> Post | None:
     return post
 
 
-def download_video(url: str, max_bytes: int) -> bytes | None:
-    """The video's bytes if it's no bigger than max_bytes (Discord's upload
-    limit), else None -- the embed then shows its cover image instead."""
+def download(url: str, max_bytes: int) -> bytes | None:
+    """The file's bytes if it's no bigger than max_bytes (Discord's upload
+    limit), else None -- the caller then links it instead of uploading."""
     try:
         with requests.get(url, headers={'User-Agent': PREVIEW_CRAWLER_AGENT}, timeout=FETCH_TIMEOUT, stream=True) as response:
             if response.status_code != 200:
@@ -341,11 +351,13 @@ def download_video(url: str, max_bytes: int) -> bytes | None:
                     return None
             return bytes(data) or None
     except requests.RequestException as e:
-        logger.debug(f"social_embeds: video download failed: {e}")
+        logger.debug(f"social_embeds: download failed: {e}")
         return None
 
 
 #=========================--FORMATTING--=====================================#
+# The text pieces of a card, top to bottom. Limits are on the post's own
+# text: Discord caps all the text in one message's cards at 4000 characters.
 
 def short_count(n: int) -> str:
     """452796 -> "452.8K", 2200 -> "2.2K", 65 -> "65"."""
@@ -355,27 +367,45 @@ def short_count(n: int) -> str:
     return str(n)
 
 
-def description(post: Post, media_hidden: bool = False, max_text: int = 1500, quoted: bool = False) -> str:
-    """The embed's body: byline, text, stats, then a small footer line with
-    the post time (shown in each reader's own timezone) and a link.
-    max_text caps the post's text, so several embeds in one reply stay
-    inside Discord's 6000-character total. A quoted post's card is the
-    quote tweet's own second embed: no stats, and it links to itself."""
-    parts = []
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def header(post: Post, icon: str = "", max_text: int = 1500) -> str:
+    """Icon and author ("**Lyker** ([@Wydlyker](...))"), or a Reddit post's
+    title and byline, then the post's text."""
+    if post.handle:
+        handle = f"[@{post.handle}]({post.author_url})" if post.author_url else f"@{post.handle}"
+        lines = [f"{icon} **{post.name}** ({handle})".strip()]
+    else:
+        lines = [f"{icon} **{_clip(post.name, 250)}**".strip()]
     if post.subtitle:
-        parts.append(post.subtitle)
+        lines.append(post.subtitle)
     if post.text:
-        text = post.text if len(post.text) <= max_text else post.text[:max_text].rstrip() + "…"
-        parts.append(text)
-    if media_hidden:
-        parts.append("*⚠️ Marked sensitive — media hidden outside age-restricted channels. Open the post to view it.*")
-    if post.more_media:
-        parts.append(f"*+{post.more_media} more*")
-    if post.stats and not quoted:
-        parts.append("  ".join(f"{emoji} **{short_count(n)}**" for emoji, n in post.stats))
-    footer = [] if quoted else [platform_name(post)]
+        lines.append(_clip(post.text, max_text))
+    return "\n".join(lines)
+
+
+def quote_block(post: Post, max_text: int = 600) -> str:
+    """The quoted post, as a block quote inside the quote tweet's card."""
+    handle = f"[@{post.handle}]({post.author_url})" if post.handle else ""
+    lines = [f"**↪ Quoting {post.name}** ({handle})" if handle else f"**↪ Quoting {post.name}**"]
+    if post.text:
+        lines.extend(_clip(post.text, max_text).splitlines())
+    when = f"Posted <t:{post.posted}:f> • " if post.posted else ""
+    lines.append(f"-# {when}[Open quoted post]({post.url})")
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
+def footer(post: Post) -> str:
+    """Stats, then "X • Posted <time> • Open in X" -- the time is a Discord
+    timestamp, shown in each reader's own timezone."""
+    lines = []
+    if post.stats:
+        lines.append("  ".join(f"{emoji} **{short_count(n)}**" for emoji, n in post.stats))
+    parts = [platform_name(post)]
     if post.posted:
-        footer.append(f"Posted <t:{post.posted}:{'D' if post.posted_date_only else 'f'}>")
-    footer.append(f"[Open quoted post]({post.url})" if quoted else f"[Open in {platform_name(post)}]({post.url})")
-    parts.append("-# " + " • ".join(footer))
-    return "\n\n".join(parts)
+        parts.append(f"Posted <t:{post.posted}:{'D' if post.posted_date_only else 'f'}>")
+    parts.append(f"[Open in {platform_name(post)}]({post.url})")
+    lines.append("-# " + " • ".join(parts))
+    return "\n".join(lines)
