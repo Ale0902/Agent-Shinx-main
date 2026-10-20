@@ -53,6 +53,16 @@ class Media:
 
 
 @dataclass
+class LinkCard:
+    """The preview X shows under a post that links somewhere."""
+    url: str
+    title: str
+    description: str | None = None
+    domain: str | None = None
+    image: str | None = None
+
+
+@dataclass
 class Post:
     platform: str                   # key into PLATFORMS
     url: str                        # the post, for "Open in ..."
@@ -68,6 +78,7 @@ class Post:
     posted_date_only: bool = False  # Instagram only gives the day
     sensitive: bool = False
     quote: "Post | None" = None     # the post a quote tweet is quoting
+    link_card: LinkCard | None = None
 
 
 # name, colour, domain (for the icon) for each platform.
@@ -178,6 +189,13 @@ def _x_post(tweet: dict, user: str, tweet_id: str) -> Post:
         elif item.get('url'):
             media.append(Media(item['url']))
     quoted = tweet.get('quote')
+    card = tweet.get('card') if isinstance(tweet.get('card'), dict) else {}
+    link_card = None
+    if card.get('url') and card.get('title'):
+        link_card = LinkCard(
+            url=card['url'], title=card['title'], description=card.get('description') or None,
+            domain=card.get('domain') or None, image=(card.get('image') or {}).get('url'),
+        )
     return Post(
         platform='x',
         url=f"https://x.com/{handle}/status/{tweet.get('id') or tweet_id}",
@@ -193,6 +211,7 @@ def _x_post(tweet: dict, user: str, tweet_id: str) -> Post:
         sensitive=bool(tweet.get('possibly_sensitive')),
         # One level only: a quote of a quote shows just the post it quotes.
         quote=_x_post({**quoted, 'quote': None}, user, '') if quoted else None,
+        link_card=link_card,
     )
 
 
@@ -371,9 +390,28 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
+def _body(post: Post, max_text: int) -> list[str]:
+    """The post's text, then its link card (title, description, site) --
+    with the card's URL dropped from the end of the text, as X does, since
+    the card now carries it."""
+    lines = []
+    text = post.text or ""
+    if post.link_card and text.rstrip().endswith(post.link_card.url):
+        text = text.rstrip()[:-len(post.link_card.url)].rstrip()
+    if text:
+        lines.append(_clip(text, max_text))
+    if card := post.link_card:
+        lines.append(f"🔗 **[{_clip(card.title, 200)}]({card.url})**")
+        if card.description:
+            lines.append(_clip(card.description, 300))
+        if card.domain:
+            lines.append(f"-# {card.domain}")
+    return lines
+
+
 def header(post: Post, icon: str = "", max_text: int = 1500) -> str:
     """Icon and author ("**Lyker** ([@Wydlyker](...))"), or a Reddit post's
-    title and byline, then the post's text."""
+    title and byline, then the post's text and link card."""
     if post.handle:
         handle = f"[@{post.handle}]({post.author_url})" if post.author_url else f"@{post.handle}"
         lines = [f"{icon} **{post.name}** ({handle})".strip()]
@@ -381,20 +419,26 @@ def header(post: Post, icon: str = "", max_text: int = 1500) -> str:
         lines = [f"{icon} **{_clip(post.name, 250)}**".strip()]
     if post.subtitle:
         lines.append(post.subtitle)
-    if post.text:
-        lines.append(_clip(post.text, max_text))
+    lines.extend(_body(post, max_text))
     return "\n".join(lines)
 
 
 def quote_block(post: Post, max_text: int = 600) -> str:
-    """The quoted post, as a block quote inside the quote tweet's card."""
+    """The quoted post, as a block quote inside the quote tweet's card.
+    ">>>" quotes everything after it, blank lines included -- a ">" per
+    line shows a bare ">" on the empty ones."""
     handle = f"[@{post.handle}]({post.author_url})" if post.handle else ""
     lines = [f"**↪ Quoting {post.name}** ({handle})" if handle else f"**↪ Quoting {post.name}**"]
-    if post.text:
-        lines.extend(_clip(post.text, max_text).splitlines())
+    lines.extend(_body(post, max_text))
     when = f"Posted <t:{post.posted}:f> • " if post.posted else ""
     lines.append(f"-# {when}[Open quoted post]({post.url})")
-    return "\n".join(f"> {line}" if line else ">" for line in lines)
+    return ">>> " + "\n".join(lines)
+
+
+def card_image(post: Post) -> str | None:
+    """The link card's image, shown as the post's media when it has none
+    of its own."""
+    return post.link_card.image if post.link_card and not post.media else None
 
 
 def footer(post: Post) -> str:

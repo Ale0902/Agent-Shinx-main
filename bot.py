@@ -1864,6 +1864,8 @@ def run_discord_bot():
                         items.append(discord.MediaGalleryItem(media.cover, spoiler=spoiler))
                 else:
                     items.append(discord.MediaGalleryItem(media.url, spoiler=spoiler))
+            if link_image := social_embeds.card_image(post):
+                items.append(discord.MediaGalleryItem(link_image))
             return discord.ui.MediaGallery(*items) if items else None
 
         def build(with_videos: bool) -> discord.ui.LayoutView:
