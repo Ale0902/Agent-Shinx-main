@@ -233,6 +233,8 @@ SOTD_VOTE_REACTIONS = ("⬆️", "⬇️")
 # Discord's upload limit for a bot: 10 MB, more in servers boosted to
 # level 2 or 3. Videos bigger than this get a cover image instead.
 BASE_UPLOAD_LIMIT = 10 * 1024 * 1024
+# The biggest X GIF (a silent .mp4) fetched to convert into a real GIF.
+GIF_SOURCE_LIMIT = 25 * 1024 * 1024
 
 
 def _features_for(guild_id) -> dict[str, str]:
@@ -1848,10 +1850,18 @@ def run_discord_bot():
             for post in posts:
                 for media in [*post.media, *(post.quote.media if post.quote else [])][:social_embeds.MAX_MEDIA]:
                     if media.video and media.url not in uploads:
-                        data = await asyncio.to_thread(social_embeds.download, media.url, upload_room)
-                        if data:
+                        # An X GIF's .mp4 can be over the limit and still make
+                        # a GIF under it, so it may be fetched at a larger size.
+                        fetch_limit = max(upload_room, GIF_SOURCE_LIMIT) if media.gif else upload_room
+                        data = await asyncio.to_thread(social_embeds.download, media.url, fetch_limit)
+                        name = f"video-{len(uploads) + 1}.mp4"
+                        if data and media.gif:
+                            gif = await asyncio.to_thread(social_embeds.mp4_to_gif, data, upload_room)
+                            if gif:
+                                data, name = gif, f"gif-{len(uploads) + 1}.gif"
+                        if data and len(data) <= upload_room:
                             upload_room -= len(data)
-                            uploads[media.url] = (f"video-{len(uploads) + 1}.mp4", data)
+                            uploads[media.url] = (name, data)
 
         def gallery(post, with_videos: bool):
             items = []
@@ -1901,11 +1911,20 @@ def run_discord_bot():
                 logger.warning(f"social previews: couldn't reply in channel {message.channel.id}: {e}")
                 return
 
-        if message.guild and permissions.manage_messages:
+        if message.guild:
             # Hide Discord's own preview of the link, usually broken or
-            # bare for these sites, so the post doesn't show twice.
-            with contextlib.suppress(discord.HTTPException):
+            # bare for these sites, so the post doesn't show twice. Only
+            # possible with Manage Messages in that channel.
+            if not permissions.manage_messages:
+                logger.info(
+                    f"social previews: can't hide the original link preview in #{getattr(message.channel, 'name', message.channel.id)} "
+                    f"({message.guild.id}) -- the bot needs Manage Messages there"
+                )
+                return
+            try:
                 await message.edit(suppress=True)
+            except discord.HTTPException as e:
+                logger.warning(f"social previews: couldn't hide the original link preview: {e}")
 
     @client.event
     async def on_ready():

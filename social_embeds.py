@@ -50,6 +50,7 @@ class Media:
     url: str
     video: bool = False
     cover: str | None = None        # a video's still, shown if the video itself can't be
+    gif: bool = False               # an X "GIF" -- really a silent .mp4, turned into a real GIF
 
 
 @dataclass
@@ -185,7 +186,7 @@ def _x_post(tweet: dict, user: str, tweet_id: str) -> Post:
     media = []
     for item in (tweet.get('media') or {}).get('all') or []:
         if item.get('type') in ('video', 'gif') and item.get('url'):
-            media.append(Media(item['url'], video=True, cover=item.get('thumbnail_url')))
+            media.append(Media(item['url'], video=True, cover=item.get('thumbnail_url'), gif=item['type'] == 'gif'))
         elif item.get('url'):
             media.append(Media(item['url']))
     quoted = tweet.get('quote')
@@ -372,6 +373,47 @@ def download(url: str, max_bytes: int) -> bytes | None:
     except requests.RequestException as e:
         logger.debug(f"social_embeds: download failed: {e}")
         return None
+
+
+# X keeps its "GIFs" as short silent .mp4s, which Discord shows with a play
+# button. A real GIF autoplays and loops, so they're converted -- a palette
+# made from the clip itself keeps the colours right, and a smaller version
+# is tried when the first comes out over the upload limit.
+GIF_ATTEMPTS = ((480, 15), (360, 12), (240, 10))  # (max width, fps)
+GIF_TIMEOUT_SECONDS = 30
+
+
+def mp4_to_gif(mp4: bytes, max_bytes: int) -> bytes | None:
+    """A looping GIF of the clip, no bigger than max_bytes, or None (no
+    ffmpeg, a failed conversion, or too big even when shrunk) -- the caller
+    then uploads the .mp4 as it was."""
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        logger.warning(f"social_embeds: no ffmpeg for GIFs ({e}); install imageio-ffmpeg")
+        return None
+    import os
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        source = os.path.join(folder, "in.mp4")
+        with open(source, "wb") as f:
+            f.write(mp4)
+        for width, fps in GIF_ATTEMPTS:
+            target = os.path.join(folder, f"out-{width}.gif")
+            filters = (f"fps={fps},scale='min({width},iw)':-2:flags=lanczos,"
+                       "split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5")
+            try:
+                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", source, "-vf", filters, "-loop", "0", target],
+                               check=True, capture_output=True, timeout=GIF_TIMEOUT_SECONDS)
+            except (subprocess.SubprocessError, OSError) as e:
+                logger.warning(f"social_embeds: GIF conversion failed: {e}")
+                return None
+            if os.path.getsize(target) <= max_bytes:
+                with open(target, "rb") as f:
+                    return f.read()
+    return None
 
 
 #=========================--FORMATTING--=====================================#
