@@ -58,6 +58,7 @@ class Post:
     posted: int | None = None       # unix time
     posted_date_only: bool = False  # Instagram only gives the day
     sensitive: bool = False
+    quote: "Post | None" = None     # the post a quote tweet is quoting
 
 
 # name, colour, icon for each platform. Icons come from Google's favicon
@@ -153,17 +154,23 @@ def _meta_tags(page: str) -> dict[str, str]:
 def _fetch_x(match: re.Match) -> Post | None:
     response = _get(f"https://api.fxtwitter.com/{match['user']}/status/{match['id']}")
     tweet = (response.json() if response else {}).get('tweet')
-    if not tweet:
-        return None
+    return _x_post(tweet, match['user'], match['id']) if tweet else None
+
+
+def _x_post(tweet: dict, user: str, tweet_id: str) -> Post:
+    """A Post from one of FxTwitter's tweet objects -- a quote tweet's
+    'quote' is one too, so the quoted post is read the same way."""
     author = tweet.get('author') or {}
+    handle = author.get('screen_name') or user
     media = tweet.get('media') or {}
     photos, videos = media.get('photos') or [], media.get('videos') or []
     first_video = videos[0] if videos else None
+    quoted = tweet.get('quote')
     return Post(
         platform='x',
-        url=f"https://x.com/{author.get('screen_name', match['user'])}/status/{match['id']}",
-        author=f"{author.get('name', match['user'])} (@{author.get('screen_name', match['user'])})",
-        author_url=f"https://x.com/{author.get('screen_name', match['user'])}",
+        url=f"https://x.com/{handle}/status/{tweet.get('id') or tweet_id}",
+        author=f"{author.get('name', handle)} (@{handle})",
+        author_url=f"https://x.com/{handle}",
         avatar=author.get('avatar_url'),
         text=tweet.get('text') or None,
         image=photos[0]['url'] if photos else (first_video or {}).get('thumbnail_url'),
@@ -174,6 +181,8 @@ def _fetch_x(match: re.Match) -> Post | None:
                if tweet.get(key) is not None],
         posted=tweet.get('created_timestamp'),
         sensitive=bool(tweet.get('possibly_sensitive')),
+        # One level only: a quote of a quote shows just the post it quotes.
+        quote=_x_post({**quoted, 'quote': None}, user, '') if quoted else None,
     )
 
 
@@ -346,24 +355,27 @@ def short_count(n: int) -> str:
     return str(n)
 
 
-def description(post: Post, media_hidden: bool = False) -> str:
+def description(post: Post, media_hidden: bool = False, max_text: int = 1500, quoted: bool = False) -> str:
     """The embed's body: byline, text, stats, then a small footer line with
-    the post time (shown in each reader's own timezone) and a link."""
+    the post time (shown in each reader's own timezone) and a link.
+    max_text caps the post's text, so several embeds in one reply stay
+    inside Discord's 6000-character total. A quoted post's card is the
+    quote tweet's own second embed: no stats, and it links to itself."""
     parts = []
     if post.subtitle:
         parts.append(post.subtitle)
     if post.text:
-        text = post.text if len(post.text) <= 1500 else post.text[:1500].rstrip() + "…"
+        text = post.text if len(post.text) <= max_text else post.text[:max_text].rstrip() + "…"
         parts.append(text)
     if media_hidden:
         parts.append("*⚠️ Marked sensitive — media hidden outside age-restricted channels. Open the post to view it.*")
     if post.more_media:
         parts.append(f"*+{post.more_media} more*")
-    if post.stats:
+    if post.stats and not quoted:
         parts.append("  ".join(f"{emoji} **{short_count(n)}**" for emoji, n in post.stats))
-    footer = [platform_name(post)]
+    footer = [] if quoted else [platform_name(post)]
     if post.posted:
         footer.append(f"Posted <t:{post.posted}:{'D' if post.posted_date_only else 'f'}>")
-    footer.append(f"[Open in {platform_name(post)}]({post.url})")
+    footer.append(f"[Open quoted post]({post.url})" if quoted else f"[Open in {platform_name(post)}]({post.url})")
     parts.append("-# " + " • ".join(footer))
     return "\n\n".join(parts)

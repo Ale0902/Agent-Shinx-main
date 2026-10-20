@@ -1794,8 +1794,19 @@ def run_discord_bot():
         upload_limit = BASE_UPLOAD_LIMIT
         if message.guild and message.guild.premium_tier >= 2:
             upload_limit = message.guild.filesize_limit
-        embeds, files, uploaded = [], [], 0
+        # One card per post, plus a second, right under it, for the post a
+        # quote tweet quotes -- each card holds one image, so the quoted
+        # post's own media gets room of its own.
+        cards = []
         for post in posts:
+            cards.append((post, False))
+            if post.quote:
+                cards.append((post.quote, True))
+        # Discord caps a message's embeds at 6000 characters in total.
+        max_text = max(200, 4500 // len(cards))
+
+        embeds, covers, files, uploaded = [], [], [], 0
+        for post, quoted in cards:
             hide_media = post.sensitive and not age_restricted
             video = None
             if post.video and not hide_media and permissions.attach_files:
@@ -1805,16 +1816,21 @@ def run_discord_bot():
                 files.append(discord.File(io.BytesIO(video), filename=f"{post.platform}-{len(files) + 1}.mp4"))
 
             embed = discord.Embed(
-                description=social_embeds.description(post, media_hidden=hide_media),
+                description=social_embeds.description(post, media_hidden=hide_media, max_text=max_text, quoted=quoted),
                 color=social_embeds.platform_color(post),
             )
-            embed.set_author(name=post.author[:256], url=post.author_url, icon_url=social_embeds.platform_icon(post))
-            if post.avatar:
-                embed.set_thumbnail(url=post.avatar)
-            if post.image and not hide_media and not video:
+            if quoted:
+                embed.set_author(name=f"Quoting {post.author}"[:256], url=post.url, icon_url=post.avatar)
+            else:
+                embed.set_author(name=post.author[:256], url=post.author_url, icon_url=social_embeds.platform_icon(post))
+                if post.avatar:
+                    embed.set_thumbnail(url=post.avatar)
+            cover = post.image if post.image and not hide_media else None
+            if cover and not video:
                 # A video plays as the attachment, so its cover would just repeat it.
-                embed.set_image(url=post.image)
+                embed.set_image(url=cover)
             embeds.append(embed)
+            covers.append(cover)
 
         try:
             await message.reply(embeds=embeds, files=files, mention_author=False)
@@ -1823,9 +1839,9 @@ def run_discord_bot():
                 logger.warning(f"social previews: couldn't reply in channel {message.channel.id}: {e}")
                 return
             # Most likely the videos were too big after all -- covers instead.
-            for embed, post in zip(embeds, posts):
-                if post.image and not (post.sensitive and not age_restricted):
-                    embed.set_image(url=post.image)
+            for embed, cover in zip(embeds, covers):
+                if cover:
+                    embed.set_image(url=cover)
             try:
                 await message.reply(embeds=embeds, mention_author=False)
             except discord.HTTPException as e:
