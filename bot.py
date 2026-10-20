@@ -213,13 +213,14 @@ def _keep_alive(body):
 # eggs that only show up if you already know about them.
 HIDDEN_COMMANDS = {'vini'}
 
-# The music commands and Song of the Day belong to one server and no other.
-# Their slash commands are registered to that server alone, so anywhere
-# else they don't exist at all; the ! versions do nothing elsewhere; and
-# Song of the Day can't be set up or sent anywhere else. /help only lists
-# them in that server.
+# /recsong and Song of the Day belong to one server and no other (the
+# song list is that server's). /recsong's slash command is registered to
+# that server alone, so anywhere else it doesn't exist at all; !recsong
+# does nothing elsewhere; and Song of the Day can't be set up or sent
+# anywhere else. /help only lists /recsong in that server. /top5songs is
+# the iTunes chart, so it's available everywhere.
 MUSIC_GUILD_ID = 748160430828027916
-MUSIC_COMMANDS = {'recsong', 'top5songs'}
+MUSIC_COMMANDS = {'recsong'}
 MUSIC_FEATURES = {'sotd'}
 
 
@@ -827,8 +828,6 @@ def run_discord_bot():
         await _send_announcement(ctx, result, artwork_as_thumbnail=True)
 
     @client.hybrid_command(name="top5songs", description="Top 5 songs on iTunes charts!")
-    @discord.app_commands.guilds(MUSIC_GUILD_ID)
-    @commands.check(_in_music_guild)
     async def top5(ctx: commands.Context):
         await ctx.defer()
         result = await asyncio.to_thread(bf.topsongs)
@@ -839,8 +838,7 @@ def run_discord_bot():
         if not isinstance(error, commands.CheckFailure):
             raise error
 
-    for command in (recsong, top5):
-        command.error(music_error)
+    recsong.error(music_error)
 
     @client.hybrid_command(name='rolld6', description='Rolls a D6 dice')
     async def rolld6(ctx: commands.Context):
@@ -1776,11 +1774,11 @@ def run_discord_bot():
         logger.info(f'{client.user} is now running!')
         await client.tree.sync()
         try:
-            # The music commands are registered to their own server only,
+            # /recsong is registered to its own server only,
             # which a global sync doesn't cover.
             await client.tree.sync(guild=discord.Object(id=MUSIC_GUILD_ID))
         except discord.HTTPException as e:
-            logger.warning(f"Couldn't sync the music commands to server {MUSIC_GUILD_ID}: {e}")
+            logger.warning(f"Couldn't sync /recsong to server {MUSIC_GUILD_ID}: {e}")
         await _post_update_log()
 
     @client.event
