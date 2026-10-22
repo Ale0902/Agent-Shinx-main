@@ -2,11 +2,14 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 import asyncio
+import collections
 import contextlib
 import datetime
 import functools
 import io
+import json
 import logging
+import math
 import random
 import re
 import time
@@ -38,6 +41,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 EASTERN = ZoneInfo("America/New_York")
+
+# Read by the Agent Shinx console (shinx-dashboard in console-portal, a
+# separate program on this machine) to show the bot's Discord connection.
+DASHBOARD_STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dashboard_status.json')
 
 # Exact cyan, used as every embed's left-hand accent color for a consistent look.
 EMBED_COLOR = discord.Color.from_rgb(0, 255, 255)
@@ -1932,16 +1939,50 @@ def run_discord_bot():
             except discord.HTTPException as e:
                 logger.warning(f"social previews: couldn't hide the original link preview: {e}")
 
+    # Slash commands used since the bot started, for dashboard_status.
+    commands_run = collections.Counter()
+
+    @client.event
+    async def on_app_command_completion(interaction: discord.Interaction, command):
+        commands_run[command.qualified_name] += 1
+
+    @tasks.loop(seconds=30)
+    async def dashboard_status():
+        # Written whole and swapped in, so the console never reads half a
+        # file. A file older than a minute or two tells it the bot is stuck.
+        latency = client.latency
+        status = {
+            't': time.time(),
+            'user': str(client.user) if client.user else None,
+            'ready': client.is_ready(),
+            'latency_ms': round(latency * 1000, 1) if math.isfinite(latency) else None,
+            'guilds': sorted(
+                ({'name': g.name, 'members': g.member_count or 0} for g in client.guilds),
+                key=lambda g: -g['members'],
+            ),
+            'loops': {loop.coro.__name__: loop.is_running() for loop in loops},
+            'commands': dict(commands_run.most_common()),
+        }
+        try:
+            tmp_path = DASHBOARD_STATUS_FILE + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump(status, f)
+            os.replace(tmp_path, DASHBOARD_STATUS_FILE)
+        except OSError as e:
+            logger.warning(f"dashboard status: couldn't write {DASHBOARD_STATUS_FILE}: {e}")
+
+    loops = (
+        sotd, new_chapter_announcements, f1_updates, jra_updates, game_announcements,
+        game_reminders, game_recaps, steam_sale_alerts, sports_bet_results, nfl_prop_menus,
+        dashboard_status,
+    )
+
     @client.event
     async def on_ready():
         # on_ready fires again whenever the gateway has to start a fresh
         # session, and starting a loop that's already running raises --
         # which aborted this handler on every reconnect after the first.
         # A loop that has stopped is started again.
-        loops = (
-            sotd, new_chapter_announcements, f1_updates, jra_updates, game_announcements,
-            game_reminders, game_recaps, steam_sale_alerts, sports_bet_results, nfl_prop_menus,
-        )
         for loop in loops:
             if not loop.is_running():
                 loop.start()
@@ -1964,7 +2005,9 @@ def run_discord_bot():
         # announcement has gone out to everyone else by the time it joins.
         await _f1_race_day_catch_up(client, guild.id)
 
-    client.run(TOKEN)
+    # log_handler=None: discord.py otherwise adds its own handler on top of
+    # basicConfig's above, and every line of the bot's log shows up twice.
+    client.run(TOKEN, log_handler=None)
 
 
 if __name__ == '__main__':
